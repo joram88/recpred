@@ -1,0 +1,317 @@
+library(shiny)
+library(alfred)
+library(tidyverse)
+library(lubridate)
+library(forecast)
+library(zoo)
+
+ui <- fluidPage(
+        
+
+titlePanel("Recession Predictor"),
+
+
+# Sidebar layout with input and output definitions ----
+sidebarLayout(
+        
+        # Sidebar to demonstrate various slider options ----
+        sidebarPanel(
+                fluidRow(h5("Where do you think these indicators will be in the next 6 months?")),
+                
+                # Input: Decimal interval with step value ----
+                sliderInput("UNRATE", "Unemployment Rate:",
+                            min = 0, max = 15,
+                            value = 0, step = 0.1),
+                
+                # Input: Decimal interval with step value ----
+                sliderInput("lag_yld", "Yield Curve Difference (1-yr lag):",
+                            min = -2, max = 4,
+                            value = 0, step = 0.1),
+                
+                # Input: Decimal interval with step value ----
+                sliderInput("CONF", "Business Confidence Index:",
+                            min = -30, max = 30,
+                            value = 0, step = 0.1),
+                
+                # Input: Decimal interval with step value ----
+                sliderInput("date", "Date:",
+                            min = as.Date("1982-01-01","%Y-%m-%d"),
+                            max = as.Date("2025-9-01","%Y-%m-%d"),
+                            value = as.Date("1982-01-01"),
+                            timeFormat = "%Y-%m"),
+                
+                fluidRow(
+                        wellPanel(
+                                actionButton("reset", "Reset Parameters", class = "btn-sm"),
+                                actionButton("submit", "Submit", class = "btn-lg btn-success"))
+                )
+        ),
+        
+        # Main panel for displaying outputs ----
+        mainPanel(
+                
+                # Output: Recession Probability
+                h4(paste("Recession probability in the next two quarters is:")),
+                tabsetPanel(
+                        tabPanel("Output",
+                                 h1(textOutput("recprob")), h5(textOutput("quarterpred"))),
+                        tabPanel("Description",
+                                 fluidRow("This Shiny App uses a simple model to predict the probability of a recession in the
+                                    following two quarters based on three leading indicators: 
+                                    1) Unemployment rate
+                                    2) The difference between the 10-year and 3 month-Treasury Yield rate
+                                    3) The
+                                    Business Confidence Index published by the OECD. All statistically significant
+                                          and uncorrelated."),
+                                 hr(),
+                                 fluidRow("Since the data sources are not all published at the same time
+                                 and are a mix of quarterly and monthly indices I had to make some basic extrapolations
+                                 using ARIMA models whenever a data point was missing in the most recent quarter.
+                                 Overall, I wanted to test Shiny's capability to have reactive output using models to make
+                                 predictions and forecasts."),
+                                 hr(),
+                                 fluidRow("When shifting the date slider it will update indicators to their levels at that
+                                          moment in time. The purpose of this app though is forward looking, by moving
+                                          sliders around you are stating where you think these sliders will be in six months.
+                                          To reset sliders to the most up-to-date information simply click Reset Parameters.
+                                          Thank you for reading!")
+                                 ),
+                        tabPanel("Data Sources",
+                                 hr(),
+                                 fluidRow("St. Louis Fed, Federal Reserve Economic Data, https://fred.stlouisfed.org/"),
+                                 hr(),
+                                 fluidRow("Datasets: T10Y3M, BSCICP02USM460S, UNRATE, USREC"),
+                                 hr(),
+                                 fluidRow("https://github.com/joram88/"))
+                )
+        ))
+        
+)
+
+
+server <- function(input, output, session) {
+        
+        
+        T10 <- get_fred_series("T10Y3M") %>%  #daily
+                mutate(date = as.yearqtr(ymd(date))) %>% 
+                filter(date > "1981 Q4")
+        
+        CONF <- get_fred_series("BSCICP02USM460S") %>%  #monthly 
+                mutate(date = as.yearqtr(ymd(date))) %>% 
+                filter(date > "1981 Q4") %>% 
+                rename(CONF = BSCICP02USM460S)
+        
+        UNRATE <- get_fred_series("UNRATE") %>%  #monthly 
+                mutate(date = as.yearqtr(ymd(date))) %>% 
+                filter(date > "1981 Q4")
+        
+        REC <- get_fred_series("USREC")  #monthly
+        
+        
+        ###################
+        
+        REC_test <- REC %>% 
+                filter(!is.na(USREC)) %>% 
+                mutate(date = as.yearqtr(ymd(date))) %>% 
+                filter(date > "1981 Q4") %>% 
+                group_by(date) %>% 
+                summarize(USREC = ifelse(mean(USREC) > 0, 1, 0))
+        
+        T10_test <- T10 %>% 
+                filter(!is.na(T10Y3M)) %>% 
+                group_by(date) %>% 
+                summarize(T10Y3M = mean(T10Y3M))
+        
+        CONF_test <- CONF %>% 
+                filter(!is.na(CONF)) %>% 
+                group_by(date) %>% 
+                summarize(CONF = mean(CONF))
+        
+        UNRATE_test <- UNRATE %>% 
+                filter(!is.na(UNRATE)) %>% 
+                group_by(date) %>% 
+                summarize(UNRATE = mean(UNRATE))
+        
+        #Old data we train the model on
+        
+        TRAIN <- list(UNRATE_test, T10_test, CONF_test, REC_test) %>% 
+                reduce(full_join, by = "date") %>% 
+                mutate(lag_yld = lag(T10Y3M, 4))
+        
+        #Create AR based forecasts of these values
+        
+        CONF_ts <- as.ts(TRAIN$CONF)
+        
+        T10_ts <- as.ts(TRAIN$T10Y3M)
+        
+        UNRATE_ts <- as.ts(TRAIN$UNRATE)
+        
+        #Fill in NAs
+        
+        (AR_CONF <- auto.arima(CONF_ts, stepwise = FALSE, approximation = FALSE))
+        
+        residuals_CONF <- AR_CONF$residuals
+        
+        paste("CONF is forecasting",sum(is.na(TRAIN$CONF)), "value/s.")
+        
+        forecast_CONF <- predict(AR_CONF, n.ahead = sum(is.na(TRAIN$CONF))+2)
+        
+        (AR_T10 <- auto.arima(T10_ts, stepwise = FALSE, approximation = FALSE))
+        
+        residuals_T10 <- AR_T10$residuals
+        
+        paste("T10 is forecasting", sum(is.na(TRAIN$T10Y3M)), "value/s.")
+        
+        forecast_T10 <- predict(AR_T10, n.ahead = sum(is.na(TRAIN$T10Y3M))+2)
+        
+        (AR_UNRATE <- auto.arima(UNRATE_ts, stepwise = FALSE, approximation = FALSE))
+        
+        residuals_UNRATE <- AR_UNRATE$residuals
+        
+        paste("Unemployment Rate is forecasting", sum(is.na(TRAIN$UNRATE)), "value/s.")
+        
+        forecast_UNRATE <- predict(AR_UNRATE, n.ahead = sum(is.na(TRAIN$UNRATE))+2)
+        
+        ######
+        
+        #Insert missing values and future prediction into time series
+        
+        #Remove NAs first then insert the predictions
+        
+        pred_lag_yld <- na.trim(T10_ts) %>% 
+                append(as.ts(forecast_T10$pred))
+        
+        pred_CONF <- na.trim(CONF_ts) %>% 
+                append(as.ts(forecast_CONF$pred))
+        
+        pred_UNRATE <- na.trim(UNRATE_ts) %>% 
+                append(as.ts(forecast_UNRATE$pred))
+        
+        old_date <- tibble(date = TRAIN$date)
+        
+        new_date <- tibble(date = c(last(TRAIN$date) + .25, last(TRAIN$date + .5)))
+        
+        all_date <- rbind(old_date, new_date)     
+        
+        future <- tibble(all_date,pred_UNRATE, pred_lag_yld, pred_CONF)
+        
+        colnames(future) <- c("date", "UNRATE", "lag_yld", "CONF")
+        
+        updateSliderInput(session, "UNRATE", value = tail(future$UNRATE, 1))
+        updateSliderInput(session, "lag_yld", value = tail(future$lag_yld, 1))
+        updateSliderInput(session, "CONF", value = tail(future$CONF, 1))
+        updateSliderInput(session, "date", value = tail(as.Date(future$date), 1))
+
+        observeEvent(input$reset, {
+                # Run whenever reset button is pressed
+                        
+                        updateSliderInput(session, "UNRATE", value = tail(future$UNRATE, 1))
+                        updateSliderInput(session, "lag_yld", value = tail(future$lag_yld, 1))
+                        updateSliderInput(session, "CONF", value = tail(future$CONF, 1))
+                        updateSliderInput(session, "date", value = tail(as.Date(future$date), 1))
+
+        })
+
+                # Run whenever Submit button is pressed
+                
+                observeEvent(input$submit, {
+                        
+                        dateconvert <- as.yearqtr(input$date) 
+                        
+                        TRAIN <- list(UNRATE_test, T10_test, CONF_test, REC_test) %>% 
+                                reduce(full_join, by = "date") %>% 
+                                mutate(lag_yld = lag(T10Y3M, 4)) %>% 
+                                filter(date < dateconvert)
+                        
+                        CONF_ts <- as.ts(TRAIN$CONF)
+                        
+                        T10_ts <- as.ts(TRAIN$T10Y3M)
+                        
+                        UNRATE_ts <- as.ts(TRAIN$UNRATE)
+                        
+                        #Fill in NAs
+                        
+                        (AR_CONF <- auto.arima(CONF_ts, stepwise = FALSE, approximation = FALSE))
+                        
+                        residuals_CONF <- AR_CONF$residuals
+                        
+                        paste("CONF is forecasting",sum(is.na(TRAIN$CONF)), "value/s.")
+                        
+                        forecast_CONF <- predict(AR_CONF, n.ahead = sum(is.na(TRAIN$CONF))+2)
+                        
+                        (AR_T10 <- auto.arima(T10_ts, stepwise = FALSE, approximation = FALSE))
+                        
+                        residuals_T10 <- AR_T10$residuals
+                        
+                        paste("T10 is forecasting", sum(is.na(TRAIN$T10Y3M)), "value/s.")
+                        
+                        forecast_T10 <- predict(AR_T10, n.ahead = sum(is.na(TRAIN$T10Y3M))+2)
+                        
+                        (AR_UNRATE <- auto.arima(UNRATE_ts, stepwise = FALSE, approximation = FALSE))
+                        
+                        residuals_UNRATE <- AR_UNRATE$residuals
+                        
+                        paste("Unemployment Rate is forecasting", sum(is.na(TRAIN$UNRATE)), "value/s.")
+                        
+                        forecast_UNRATE <- predict(AR_UNRATE, n.ahead = sum(is.na(TRAIN$UNRATE))+2)
+                        
+                        ######
+                        
+                        #Insert missing values and future prediction into time series
+                        
+                        #Remove NAs first then insert the predictions
+                        
+                        pred_lag_yld <- na.trim(T10_ts) %>% 
+                                append(as.ts(forecast_T10$pred))
+                        
+                        pred_CONF <- na.trim(CONF_ts) %>% 
+                                append(as.ts(forecast_CONF$pred))
+                        
+                        pred_UNRATE <- na.trim(UNRATE_ts) %>% 
+                                append(as.ts(forecast_UNRATE$pred))
+                        
+                        old_date <- tibble(date = TRAIN$date)
+                        
+                        new_date <- tibble(date = c(last(TRAIN$date) + .25, last(TRAIN$date + .5)))
+                        
+                        all_date <- rbind(old_date, new_date)     
+                        
+                        future <- tibble(all_date,pred_UNRATE, pred_lag_yld, pred_CONF)
+                        
+                        colnames(future) <- c("date", "UNRATE", "lag_yld", "CONF")
+                        
+                        updateSliderInput(session, "UNRATE", value = tail(future$UNRATE, 1))
+                        updateSliderInput(session, "lag_yld", value = tail(future$lag_yld, 1))
+                        updateSliderInput(session, "CONF", value = tail(future$CONF, 1))
+                        updateSliderInput(session, "date", value = tail(as.Date(future$date), 1))
+                        
+                        #binary outcome glm
+                        
+                        bimodel <- glm(USREC ~ UNRATE + lag_yld + CONF, data = TRAIN, family = "gaussian")
+                        
+
+                        
+                       output$recprob <- renderText({
+                               
+                               inputtedvalues <- tibble(
+                                       date = c(tail(future$date,2)[-2], input$date),
+                                       UNRATE = c(tail(future$UNRATE,2)[-2], input$UNRATE),
+                                       lag_yld = c(tail(future$lag_yld,2)[-2], input$lag_yld),
+                                       CONF = c(tail(future$CONF,2)[-2], input$CONF))
+                               
+                            
+                               bitest <- predict(bimodel, newdata = inputtedvalues, type = "response")
+                               
+                               paste(as.character(round((1-(1-bitest[1])*(1-bitest[2]))*100),2), "%")
+                               
+                               })
+                       
+                       output$quarterpred <- renderText({
+                               paste("Predicted quarter: Q", quarter(last(as.Date(future$date))), year(last(as.Date(future$date))))
+                       })
+                        
+        })
+}
+
+
+shinyApp(ui, server)
